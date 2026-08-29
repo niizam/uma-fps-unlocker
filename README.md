@@ -23,6 +23,17 @@
   - `cargo build --release`
   - Built artifacts appear in `target/release`.
 
+### **Publishing a Release**
+- Push a version tag matching `v*`, for example:
+  ```sh
+  git tag v0.1.0
+  git push origin v0.1.0
+  ```
+- GitHub Actions builds the x64 Windows DLL and injectors, packages them with
+  `fps.sh`, `README.md`, and `LICENSE`, then creates the matching GitHub Release.
+- Re-running the workflow for an existing tag replaces the ZIP asset when the
+  repository does not enforce immutable releases.
+
 ### **Linux / Steam Proton**
 The Windows injectors can be driven from Linux through Steam Proton. A POSIX
 `fps.sh` wrapper launches the game with the original Proton command and then

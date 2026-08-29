@@ -1,0 +1,128 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    name: Build Windows artifacts
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Build release binaries
+        run: cargo build --release --locked
+
+      - name: Verify build outputs
+        shell: pwsh
+        run: |
+          $expected = @(
+            "target/release/uma_unlocker.dll",
+            "target/release/uma_unlock_jp.exe",
+            "target/release/uma_unlock_global.exe",
+            "target/release/uma_unlock_gui.exe"
+          )
+          $missing = $expected | Where-Object { -not (Test-Path -LiteralPath $_ -PathType Leaf) }
+          if ($missing) {
+            Write-Error "Missing build artifacts: $($missing -join ', ')"
+            exit 1
+          }
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-build
+          path: |
+            target/release/uma_unlocker.dll
+            target/release/uma_unlock_jp.exe
+            target/release/uma_unlock_global.exe
+            target/release/uma_unlock_gui.exe
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: build-windows
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Download Windows artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: windows-build
+          path: staging/uma-fps-unlocker
+
+      - name: Package release
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_dir="staging/uma-fps-unlocker"
+          cp fps.sh README.md LICENSE "$package_dir/"
+          chmod +x "$package_dir/fps.sh"
+
+          expected=(
+            uma_unlocker.dll
+            uma_unlock_jp.exe
+            uma_unlock_global.exe
+            uma_unlock_gui.exe
+            fps.sh
+            README.md
+            LICENSE
+          )
+          for file in "${expected[@]}"; do
+            if [[ ! -f "$package_dir/$file" ]]; then
+              echo "::error::Missing release file: $file"
+              exit 1
+            fi
+          done
+
+          mapfile -t packaged < <(find "$package_dir" -maxdepth 1 -type f -printf '%f\n' | sort)
+          mapfile -t wanted < <(printf '%s\n' "${expected[@]}" | sort)
+          if [[ "${packaged[*]}" != "${wanted[*]}" ]]; then
+            echo "::error::Unexpected release file set"
+            printf 'Packaged: %s\n' "${packaged[*]}"
+            exit 1
+          fi
+
+          (cd staging && zip -r ../uma-fps-unlocker.zip uma-fps-unlocker)
+
+      - name: Upload packaged workflow artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: uma-fps-unlocker-${{ github.ref_name }}
+          path: uma-fps-unlocker.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="uma-fps-unlocker.zip"
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$asset" --clobber
+          else
+            gh release create "$RELEASE_TAG" "$asset" \
+              --verify-tag \
+              --generate-notes \
+              --title "$RELEASE_TAG"
+          fi
