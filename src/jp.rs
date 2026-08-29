@@ -1,3 +1,5 @@
+mod injector_wait;
+
 use std::{ffi::CStr, io::Write, path::PathBuf};
 
 use widestring::U16CString;
@@ -9,15 +11,17 @@ use windows::{
             Diagnostics::{
                 Debug::WriteProcessMemory,
                 ToolHelp::{
-                    CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS,
+                    CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32,
+                    TH32CS_SNAPPROCESS,
                 },
             },
             LibraryLoader::{GetModuleHandleA, GetProcAddress},
             Memory::{VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, PAGE_READWRITE},
             ProcessStatus::K32GetModuleFileNameExW,
             Threading::{
-                CreateRemoteThread, OpenProcess, WaitForSingleObject, PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION,
-                PROCESS_VM_OPERATION, PROCESS_VM_READ, PROCESS_VM_WRITE, INFINITE,
+                CreateRemoteThread, OpenProcess, WaitForSingleObject, INFINITE,
+                PROCESS_CREATE_THREAD, PROCESS_QUERY_INFORMATION, PROCESS_VM_OPERATION,
+                PROCESS_VM_READ, PROCESS_VM_WRITE,
             },
         },
     },
@@ -44,6 +48,25 @@ fn find_pid_by_names(names: &[&str]) -> Option<u32> {
     None
 }
 
+fn parse_wait(args: &mut impl Iterator<Item = String>) -> u64 {
+    match args.next() {
+        Some(v) => match v.parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!(
+                    "Invalid --wait value '{}': expected a nonnegative integer (seconds).",
+                    v
+                );
+                std::process::exit(1);
+            }
+        },
+        None => {
+            eprintln!("Missing value for --wait: expected a nonnegative integer (seconds).");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn get_process_image_path(pid: u32) -> Option<PathBuf> {
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, pid).ok()?;
@@ -53,7 +76,9 @@ fn get_process_image_path(pid: u32) -> Option<PathBuf> {
             let _ = CloseHandle(handle);
             return None;
         }
-        let path = U16CString::from_vec_unchecked(buf[..len].to_vec()).to_string().ok()?;
+        let path = U16CString::from_vec_unchecked(buf[..len].to_vec())
+            .to_string()
+            .ok()?;
         let _ = CloseHandle(handle);
         Some(PathBuf::from(path))
     }
@@ -69,26 +94,43 @@ fn write_target_fps(game_dir: &PathBuf, fps: i32) -> std::io::Result<()> {
 fn write_vsync(game_dir: &PathBuf, enable: bool) -> std::io::Result<()> {
     let path = game_dir.join("unlocker_vsync.txt");
     let mut f = std::fs::File::create(path)?;
-    write!(f, "{}", if enable {"1"} else {"0"})?;
+    write!(f, "{}", if enable { "1" } else { "0" })?;
     Ok(())
 }
 
 fn inject_dll(pid: u32, dll_path: &PathBuf) -> windows::core::Result<()> {
     unsafe {
         let proc = OpenProcess(
-            PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
+            PROCESS_CREATE_THREAD
+                | PROCESS_QUERY_INFORMATION
+                | PROCESS_VM_OPERATION
+                | PROCESS_VM_WRITE
+                | PROCESS_VM_READ,
             false,
             pid,
         )?;
 
         let dll_w = U16CString::from_str(dll_path.as_os_str().to_string_lossy().as_ref()).unwrap();
-        let alloc = VirtualAllocEx(proc, None, ((dll_w.len() + 1) * 2) as usize, MEM_COMMIT, PAGE_READWRITE);
+        let alloc = VirtualAllocEx(
+            proc,
+            None,
+            ((dll_w.len() + 1) * 2) as usize,
+            MEM_COMMIT,
+            PAGE_READWRITE,
+        );
         if alloc.is_null() {
             let _ = CloseHandle(proc);
             return Err(windows::core::Error::from_win32());
         }
 
-        let write_ok = WriteProcessMemory(proc, alloc, dll_w.as_ptr() as _, ((dll_w.len() + 1) * 2) as usize, None).is_ok();
+        let write_ok = WriteProcessMemory(
+            proc,
+            alloc,
+            dll_w.as_ptr() as _,
+            ((dll_w.len() + 1) * 2) as usize,
+            None,
+        )
+        .is_ok();
         if !write_ok {
             VirtualFreeEx(proc, alloc, 0, MEM_RELEASE).ok();
             let _ = CloseHandle(proc);
@@ -101,7 +143,15 @@ fn inject_dll(pid: u32, dll_path: &PathBuf) -> windows::core::Result<()> {
         let load_library_w = GetProcAddress(k32, PCSTR(loadlib.as_ptr() as _))
             .ok_or_else(|| windows::core::Error::from_win32())?;
 
-        let thread = CreateRemoteThread(proc, None, 0, Some(std::mem::transmute(load_library_w)), Some(alloc), 0, None)?;
+        let thread = CreateRemoteThread(
+            proc,
+            None,
+            0,
+            Some(std::mem::transmute(load_library_w)),
+            Some(alloc),
+            0,
+            None,
+        )?;
         let _ = WaitForSingleObject(thread, INFINITE);
 
         VirtualFreeEx(proc, alloc, 0, MEM_RELEASE).ok();
@@ -116,32 +166,46 @@ fn main() {
     // Defaults; change via flags
     let mut fps = 120i32;
     let mut vsync: Option<bool> = None;
+    let mut wait_seconds: u64 = 0;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--fps" => {
                 if let Some(v) = args.next() {
-                    if let Ok(n) = v.parse::<i32>() { fps = n.max(1); }
+                    if let Ok(n) = v.parse::<i32>() {
+                        fps = n.max(1);
+                    }
                 }
             }
             "--vsync" => {
                 if let Some(v) = args.next() {
                     let vl = v.to_ascii_lowercase();
-                    let enable = matches!(vl.as_str(), "1"|"on"|"true"|"enable"|"enabled");
-                    let disable = matches!(vl.as_str(), "0"|"off"|"false"|"disable"|"disabled");
-                    if enable { vsync = Some(true); }
-                    else if disable { vsync = Some(false); }
+                    let enable = matches!(vl.as_str(), "1" | "on" | "true" | "enable" | "enabled");
+                    let disable =
+                        matches!(vl.as_str(), "0" | "off" | "false" | "disable" | "disabled");
+                    if enable {
+                        vsync = Some(true);
+                    } else if disable {
+                        vsync = Some(false);
+                    }
                 }
+            }
+            "--wait" => {
+                wait_seconds = parse_wait(&mut args);
             }
             _ => {}
         }
     }
 
     let names = ["umamusume.exe", "umamusumeprettyderby_jpn.exe"];
-    let pid = match find_pid_by_names(&names) {
+    let pid = match injector_wait::find_pid_with_wait(|| find_pid_by_names(&names), wait_seconds) {
         Some(pid) => pid,
         None => {
-            eprintln!("JP process not found (umamusume.exe / umamusumeprettyderby_jpn.exe). Start the game first.");
+            if wait_seconds > 0 {
+                eprintln!("JP process not found within {} seconds (umamusume.exe / umamusumeprettyderby_jpn.exe).", wait_seconds);
+            } else {
+                eprintln!("JP process not found (umamusume.exe / umamusumeprettyderby_jpn.exe). Start the game first.");
+            }
             std::process::exit(1);
         }
     };
@@ -166,7 +230,11 @@ fn main() {
         }
     }
 
-    let dll_path = std::env::current_exe().unwrap().parent().unwrap().join("uma_unlocker.dll");
+    let dll_path = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("uma_unlocker.dll");
     if !dll_path.exists() {
         eprintln!("uma_unlocker.dll not found next to the injector.");
         std::process::exit(1);
@@ -178,7 +246,11 @@ fn main() {
     }
 
     if let Some(v) = vsync {
-        println!("Injected. Target FPS = {}, VSync = {}", fps, if v {"on"} else {"off"});
+        println!(
+            "Injected. Target FPS = {}, VSync = {}",
+            fps,
+            if v { "on" } else { "off" }
+        );
     } else {
         println!("Injected. Target FPS = {}", fps);
     }
